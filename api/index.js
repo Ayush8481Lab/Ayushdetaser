@@ -6,158 +6,146 @@ export default async function handler(req, res) {
     }
 
     try {
-        // 1. Scrape Spotify Data via Jina
+        // 1. Fetch the Page as Text via Jina
         const jinaUrl = `https://r.jina.ai/${link}`;
         const jinaResponse = await fetch(jinaUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         const text = await jinaResponse.text();
 
-        // --- PARSING LOGIC ---
+        // --- HELPER FUNCTIONS ---
 
-        // A. Helper to find Artist Images
-        // Scans the text for ![Image 91: Artist Name](Image URL)
-        const extractArtistImage = (artistName) => {
-            const regex = new RegExp(`!\\[Image \\d+: ${escapeRegExp(artistName)}\\]\\((https:\\/\\/i\\.scdn\\.co\\/image\\/[^)]+)\\)`);
-            const match = text.match(regex);
-            return match ? match[1] : null;
-        };
-
-        function escapeRegExp(string) {
-            return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // A. Extract all images first to map Artist Names to their Images
+        const artistImageMap = {};
+        const imageRegex = /!\[Image \d+: (.*?)\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)/g;
+        let imgMatch;
+        while ((imgMatch = imageRegex.exec(text)) !== null) {
+            // Map "Amitabh Bhattacharya" -> "https://..."
+            artistImageMap[imgMatch[1].trim()] = imgMatch[2];
         }
 
-        // B. Extract Current Song Details
-        const mainImageMatch = text.match(/!\[Image \d+:.*?\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)/);
-        const mainTitleMatch = text.match(/Title: (.*?)(\n|$)/);
+        // B. Function to clean text
+        const cleanText = (str) => str.replace(/\[|\]/g, '').trim();
+
+        // --- PARSING CURRENT SONG ---
+
+        // 1. Title
+        const titleMatch = text.match(/Title: (.*?)(\n|$)/);
+        let rawTitle = titleMatch ? titleMatch[1] : "Unknown";
+        // Clean title (remove " - song and lyrics by...")
+        const songTitle = rawTitle.split(' - song')[0].split(' (From')[0].trim();
+        const fullTitle = rawTitle.split(' - song')[0].trim();
+
+        // 2. Main Banner
+        // Usually the first image in the document or specific Main content image
+        const bannerMatch = text.match(/!\[Image \d+:.*?\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)/);
+        const songBanner = bannerMatch ? bannerMatch[1] : "";
+
+        // 3. Current Artists
+        // We look for links that are labeled as "Artist" or appear before recommendations
+        const contentBeforeRecs = text.split("Recommended Based on this song")[0];
+        // Regex to find [Name](SpotifyLink)
+        const artistLinkRegex = /\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)/g;
         
-        // Find lines that look like: Artist[Name](Link)
-        // This is safer than the previous method because it looks for the "Artist" tag
-        const artistSectionRegex = /Artist\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)/g;
-        let artistMatch;
+        let artistMatches;
         const currentArtists = [];
         const seenArtists = new Set();
 
-        while ((artistMatch = artistSectionRegex.exec(text)) !== null) {
-            const name = artistMatch[1];
-            const url = artistMatch[2];
+        while ((artistMatches = artistLinkRegex.exec(contentBeforeRecs)) !== null) {
+            const name = artistMatches[1];
+            const url = artistMatches[2];
 
-            if (!seenArtists.has(name)) {
+            // Filter out generic links
+            if (!name.includes("Spotify") && !name.includes("Log in") && !seenArtists.has(name)) {
                 seenArtists.add(name);
                 currentArtists.push({
                     name: name,
                     spotify_url: url,
-                    image_url: extractArtistImage(name) // Get the image we found earlier
+                    image: artistImageMap[name] || null // Look up image we found earlier
                 });
             }
         }
 
-        // Fallback: If "Artist[Name]" pattern fails, try generic links near the top
-        if (currentArtists.length === 0) {
-            const fallbackRegex = /\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)/g;
-            let fallbackMatch;
-            let count = 0;
-            while ((fallbackMatch = fallbackRegex.exec(text)) !== null && count < 3) {
-                const name = fallbackMatch[1];
-                if (!name.includes("Spotify") && !seenArtists.has(name)) {
-                    seenArtists.add(name);
-                    currentArtists.push({
-                        name: name,
-                        spotify_url: fallbackMatch[2],
-                        image_url: extractArtistImage(name)
-                    });
-                    count++;
-                }
-            }
-        }
+        // --- PARSING RECOMMENDATIONS ---
 
-        const currentSong = {
-            title: mainTitleMatch ? mainTitleMatch[1].replace(' - song and lyrics by', '').split(' (From')[0].trim() : "Unknown",
-            full_title: mainTitleMatch ? mainTitleMatch[1] : "",
-            banner: mainImageMatch ? mainImageMatch[1] : "",
-            artists: currentArtists, // Now contains image_url
-            spotify_link: link
-        };
-
-        // C. Extract Recommendations
-        // We look for the section "Recommended Based on this song"
         const recSection = text.split("Recommended Based on this song")[1] || "";
+        // Pattern: Image -> Title -> Link -> Artists
         const recPattern = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[^)]+)\)((?:.|\n)*?)(?=\n\n|\n!\[)/g;
 
-        let recMatches;
-        let recommendations = [];
+        let recParams;
+        const recommendations = [];
 
-        while ((recMatches = recPattern.exec(recSection)) !== null) {
-            const recBanner = recMatches[1];
-            const recTitle = recMatches[2];
-            const recLink = recMatches[3];
-            const rawRecArtists = recMatches[4];
+        while ((recParams = recPattern.exec(recSection)) !== null) {
+            const rBanner = recParams[1];
+            const rTitle = recParams[2];
+            const rLink = recParams[3];
+            const rRawArtists = recParams[4];
 
-            // Extract artists names from the block
-            const recArtistMatches = [...rawRecArtists.matchAll(/\[([^\]]+)\]/g)];
-            const recArtistNames = recArtistMatches.map(m => m[1]).join(", ");
+            // Extract artist names from the raw block
+            const rArtistMatches = [...rRawArtists.matchAll(/\[([^\]]+)\]/g)];
+            const rArtistNames = rArtistMatches.map(m => m[1]).join(", ");
 
             recommendations.push({
-                title: recTitle,
-                artist_names: recArtistNames,
-                banner: recBanner,
-                spotify_link: recLink
+                title: rTitle,
+                artist_names: rArtistNames,
+                banner: rBanner,
+                spotify_link: rLink
             });
         }
 
-        // 2. Fetch Stream Links (External API)
-        const fetchStream = async (songName, artistName) => {
+        // --- FETCHING STREAM LINKS (THE IMPORTANT PART) ---
+
+        // Helper function to call external API
+        const getStreamData = async (queryTitle, queryArtists) => {
             try {
-                // Remove special chars for better search matching
-                const cleanSong = songName.replace(/[()]/g, '');
-                const query = `${cleanSong} ${artistName}`;
+                // Construct query: "SongName ArtistName"
+                const searchQ = `${queryTitle} ${queryArtists || ""}`;
+                const apiUrl = `https://ayushm-psi.vercel.app/api/search/songs?query=${encodeURIComponent(searchQ)}`;
                 
-                const apiUrl = `https://ayushm-psi.vercel.app/api/search/songs?query=${encodeURIComponent(query)}`;
-                const resp = await fetch(apiUrl);
-                const data = await resp.json();
+                const response = await fetch(apiUrl);
+                const data = await response.json();
 
                 if (data.success && data.data.results.length > 0) {
-                    // Try to find an exact match first, otherwise return the first result
-                    const exactMatch = data.data.results.find(r => 
-                        r.name.toLowerCase().includes(songName.toLowerCase().split(' (')[0])
-                    );
-                    
-                    const bestResult = exactMatch || data.data.results[0];
-
-                    return {
-                        found: true,
-                        match_name: bestResult.name,
-                        quality: bestResult.downloadUrl // Returns array of 12kbps to 320kbps
-                    };
+                    // We take the first result as the best match
+                    return data.data.results[0].downloadUrl; // This is the array [12kbps, 320kbps, etc]
                 }
-                return { found: false, error: "Not found" };
+                return null;
             } catch (e) {
-                return { found: false, error: "API Error" };
+                return null;
             }
         };
 
-        // Get Stream for Current Song
-        const currentStreamData = await fetchStream(currentSong.title, currentSong.artists.map(a => a.name).join(" "));
-        currentSong.stream_info = currentStreamData;
-
-        // Get Streams for Recommendations (Limit to first 8 for speed)
-        const recsToProcess = recommendations.slice(0, 8);
+        // 1. Get Stream for CURRENT SONG
+        // We use Promise.all to fetch current song and recommendations in parallel (faster)
+        const currentStreamPromise = getStreamData(songTitle, currentArtists.map(a => a.name).join(" "));
         
-        const recsWithStreams = await Promise.all(recsToProcess.map(async (rec) => {
-            const streamData = await fetchStream(rec.title, rec.artist_names);
-            return {
-                ...rec,
-                stream_info: streamData
-            };
-        }));
+        // 2. Get Streams for RECOMMENDATIONS (Limit to 10)
+        const recsPromises = recommendations.slice(0, 10).map(async (rec) => {
+            const streams = await getStreamData(rec.title, rec.artist_names);
+            return { ...rec, stream_urls: streams };
+        });
 
-        // 3. Return Final JSON
+        // Wait for everything to finish
+        const [currentStreams, ...recsWithStreams] = await Promise.all([
+            currentStreamPromise,
+            ...recsPromises
+        ]);
+
+        // --- FINAL RESPONSE ---
+
         return res.status(200).json({
             status: "success",
             source_link: link,
-            current_song: currentSong,
+            current_song: {
+                title: fullTitle,
+                search_title: songTitle, // The cleaned title used for search
+                banner: songBanner,
+                artists: currentArtists,
+                spotify_link: link,
+                stream_urls: currentStreams || [] // HERE IS YOUR STREAM DATA
+            },
             recommendations: recsWithStreams
         });
 
     } catch (error) {
-        return res.status(500).json({ error: "Something went wrong", details: error.message });
+        return res.status(500).json({ error: "Failed to process", details: error.message });
     }
-                                     }
+            }
