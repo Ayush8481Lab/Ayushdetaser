@@ -13,27 +13,58 @@ export default async function handler(req, res) {
 
         // --- PARSING LOGIC ---
 
-        // A. Extract Current Song Details
-        // Regex looks for the Main Title and the Main Image at the top
+        // A. Helper to find Artist Images
+        // Scans the text for ![Image 91: Artist Name](Image URL)
+        const extractArtistImage = (artistName) => {
+            const regex = new RegExp(`!\\[Image \\d+: ${escapeRegExp(artistName)}\\]\\((https:\\/\\/i\\.scdn\\.co\\/image\\/[^)]+)\\)`);
+            const match = text.match(regex);
+            return match ? match[1] : null;
+        };
+
+        function escapeRegExp(string) {
+            return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+
+        // B. Extract Current Song Details
         const mainImageMatch = text.match(/!\[Image \d+:.*?\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)/);
         const mainTitleMatch = text.match(/Title: (.*?)(\n|$)/);
         
-        // Extract Artists (Finding lines like [Name](link))
-        const artistPattern = /\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)/g;
-        const allLinks = [...text.matchAll(artistPattern)];
-        
-        // We assume the first few artists mentioned after the title are the main artists
-        // This is a heuristic, we take unique artists from the start
-        let currentArtists = [];
+        // Find lines that look like: Artist[Name](Link)
+        // This is safer than the previous method because it looks for the "Artist" tag
+        const artistSectionRegex = /Artist\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)/g;
+        let artistMatch;
+        const currentArtists = [];
         const seenArtists = new Set();
-        
-        for (let i = 0; i < 5; i++) { // Check first 5 matches usually main artists
-            if (allLinks[i]) {
-                const name = allLinks[i][1];
-                const url = allLinks[i][2];
-                if (!seenArtists.has(name) && !name.includes("Spotify") && !name.includes("Log in")) {
+
+        while ((artistMatch = artistSectionRegex.exec(text)) !== null) {
+            const name = artistMatch[1];
+            const url = artistMatch[2];
+
+            if (!seenArtists.has(name)) {
+                seenArtists.add(name);
+                currentArtists.push({
+                    name: name,
+                    spotify_url: url,
+                    image_url: extractArtistImage(name) // Get the image we found earlier
+                });
+            }
+        }
+
+        // Fallback: If "Artist[Name]" pattern fails, try generic links near the top
+        if (currentArtists.length === 0) {
+            const fallbackRegex = /\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/artist\/[^)]+)\)/g;
+            let fallbackMatch;
+            let count = 0;
+            while ((fallbackMatch = fallbackRegex.exec(text)) !== null && count < 3) {
+                const name = fallbackMatch[1];
+                if (!name.includes("Spotify") && !seenArtists.has(name)) {
                     seenArtists.add(name);
-                    currentArtists.push({ name, url });
+                    currentArtists.push({
+                        name: name,
+                        spotify_url: fallbackMatch[2],
+                        image_url: extractArtistImage(name)
+                    });
+                    count++;
                 }
             }
         }
@@ -42,11 +73,11 @@ export default async function handler(req, res) {
             title: mainTitleMatch ? mainTitleMatch[1].replace(' - song and lyrics by', '').split(' (From')[0].trim() : "Unknown",
             full_title: mainTitleMatch ? mainTitleMatch[1] : "",
             banner: mainImageMatch ? mainImageMatch[1] : "",
-            artists: currentArtists,
+            artists: currentArtists, // Now contains image_url
             spotify_link: link
         };
 
-        // B. Extract Recommendations
+        // C. Extract Recommendations
         // We look for the section "Recommended Based on this song"
         const recSection = text.split("Recommended Based on this song")[1] || "";
         const recPattern = /!\[Image \d+\]\((https:\/\/i\.scdn\.co\/image\/[^)]+)\)\s*\n\s*\[([^\]]+)\]\((https:\/\/open\.spotify\.com\/track\/[^)]+)\)((?:.|\n)*?)(?=\n\n|\n!\[)/g;
@@ -60,7 +91,7 @@ export default async function handler(req, res) {
             const recLink = recMatches[3];
             const rawRecArtists = recMatches[4];
 
-            // Extract artists from the raw text block
+            // Extract artists names from the block
             const recArtistMatches = [...rawRecArtists.matchAll(/\[([^\]]+)\]/g)];
             const recArtistNames = recArtistMatches.map(m => m[1]).join(", ");
 
@@ -72,38 +103,49 @@ export default async function handler(req, res) {
             });
         }
 
-        // 2. Fetch Stream Links (Parallel Processing for Speed)
-        // We define a helper function to call the external API
+        // 2. Fetch Stream Links (External API)
         const fetchStream = async (songName, artistName) => {
             try {
-                const query = `${songName} ${artistName}`;
+                // Remove special chars for better search matching
+                const cleanSong = songName.replace(/[()]/g, '');
+                const query = `${cleanSong} ${artistName}`;
+                
                 const apiUrl = `https://ayushm-psi.vercel.app/api/search/songs?query=${encodeURIComponent(query)}`;
                 const resp = await fetch(apiUrl);
                 const data = await resp.json();
 
                 if (data.success && data.data.results.length > 0) {
-                    // Return the first match's download URLs
-                    return data.data.results[0].downloadUrl;
+                    // Try to find an exact match first, otherwise return the first result
+                    const exactMatch = data.data.results.find(r => 
+                        r.name.toLowerCase().includes(songName.toLowerCase().split(' (')[0])
+                    );
+                    
+                    const bestResult = exactMatch || data.data.results[0];
+
+                    return {
+                        found: true,
+                        match_name: bestResult.name,
+                        quality: bestResult.downloadUrl // Returns array of 12kbps to 320kbps
+                    };
                 }
-                return null;
+                return { found: false, error: "Not found" };
             } catch (e) {
-                return null;
+                return { found: false, error: "API Error" };
             }
         };
 
         // Get Stream for Current Song
         const currentStreamData = await fetchStream(currentSong.title, currentSong.artists.map(a => a.name).join(" "));
-        currentSong.stream_links = currentStreamData || "Not Found";
+        currentSong.stream_info = currentStreamData;
 
-        // Get Streams for Recommendations (Limit to first 10 to be safe)
-        const recsToProcess = recommendations.slice(0, 10);
+        // Get Streams for Recommendations (Limit to first 8 for speed)
+        const recsToProcess = recommendations.slice(0, 8);
         
-        // Use Promise.all to fetch them all at the same time (fast)
         const recsWithStreams = await Promise.all(recsToProcess.map(async (rec) => {
-            const streams = await fetchStream(rec.title, rec.artist_names);
+            const streamData = await fetchStream(rec.title, rec.artist_names);
             return {
                 ...rec,
-                stream_links: streams || "Not Found"
+                stream_info: streamData
             };
         }));
 
@@ -118,4 +160,4 @@ export default async function handler(req, res) {
     } catch (error) {
         return res.status(500).json({ error: "Something went wrong", details: error.message });
     }
-    }
+                                     }
